@@ -1,40 +1,475 @@
-#!/usr/bin/env python3
-"""
-Telegram Account Manager Bot (Russian Version)
-Бот для управления Telegram аккаунтами
-"""
-
 import os
-import asyncio
-import logging
-import sqlite3
-import json
-import random
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
-from enum import Enum
 import re
+import asyncio
+import aiohttp
+import requests
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Tuple
 
-from dotenv import load_dotenv
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
-)
+from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, ConversationHandler,
-    filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes
 )
+from urllib.parse import urlparse, urljoin
+from bs4 import BeautifulSoup
+import yt_dlp
+from dotenv import load_dotenv
 
-# Загрузка переменных окружения
+# Загружаем переменные окружения из .env файла
 load_dotenv()
 
-# Конфигурация бота
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
-DATABASE_FILE = 'telegram_bot.db'
-MASTER_PASSWORD = "1488"  # Мастер-пароль для входа
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO if os.getenv('DEBUG', 'False').lower() != 'true' else logging.DEBUG
+)
+logger = logging.getLogger(__name__)
 
+# Конфигурация из .env
+TOKEN = os.getenv('BOT_TOKEN')
+if not TOKEN:
+    raise ValueError("BOT_TOKEN не найден в .env файле!")
+
+DOWNLOAD_TIMEOUT = int(os.getenv('DOWNLOAD_TIMEOUT', '30'))
+MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', '50')) * 1024 * 1024  # Конвертируем в байты
+CLEANUP_INTERVAL = int(os.getenv('CLEANUP_INTERVAL', '3600'))
+
+# Настройка прокси (если указаны в .env)
+PROXY_CONFIG = {}
+http_proxy = os.getenv('HTTP_PROXY')
+https_proxy = os.getenv('HTTPS_PROXY')
+
+if http_proxy:
+    PROXY_CONFIG['http'] = http_proxy
+if https_proxy:
+    PROXY_CONFIG['https'] = https_proxy
+
+class PinterestDownloader:
+    def __init__(self):
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+        }
+        self.session = None
+        
+    async def create_session(self):
+        """Создает aiohttp сессию с прокси если нужно"""
+        if not self.session:
+            connector = aiohttp.TCPConnector(ssl=False)
+            self.session = aiohttp.ClientSession(
+                connector=connector,
+                headers=self.headers,
+                timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
+            )
+        return self.session
+    
+    async def close_session(self):
+        """Закрывает aiohttp сессию"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+    
+    def is_pinterest_url(self, url: str) -> bool:
+        """Проверяет, является ли ссылка Pinterest"""
+        pinterest_domains = [
+            'pinterest.com',
+            'pinterest.ru',
+            'pin.it',
+            'pinterest.co.uk',
+            'pinterest.ca',
+            'pinterest.fr',
+            'pinterest.de',
+            'pinterest.jp',
+            'pinterest.com.au'
+        ]
+        
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            
+            # Убираем www и другие субдомены
+            if domain.startswith('www.'):
+                domain = domain[4:]
+                
+            return any(pinterest_domain in domain for pinterest_domain in pinterest_domains)
+        except:
+            return False
+    
+    async def extract_media_urls(self, soup: BeautifulSoup, base_url: str) -> dict:
+        """Извлекает URL медиа из HTML страницы Pinterest"""
+        media_info = {
+            'videos': [],
+            'images': [],
+            'title': '',
+            'description': ''
+        }
+        
+        try:
+            # Извлекаем заголовок и описание
+            title_tag = soup.find('meta', property='og:title') or soup.find('meta', {'name': 'title'})
+            if title_tag:
+                media_info['title'] = title_tag.get('content', '')
+            
+            desc_tag = soup.find('meta', property='og:description') or soup.find('meta', {'name': 'description'})
+            if desc_tag:
+                media_info['description'] = desc_tag.get('content', '')
+            
+            # Ищем видео
+            # 1. В тегах video
+            for video in soup.find_all('video'):
+                if video.get('src'):
+                    video_url = urljoin(base_url, video['src'])
+                    media_info['videos'].append(video_url)
+                # Проверяем source внутри video
+                for source in video.find_all('source'):
+                    if source.get('src'):
+                        video_url = urljoin(base_url, source['src'])
+                        media_info['videos'].append(video_url)
+            
+            # 2. В meta-тегах
+            for meta in soup.find_all('meta'):
+                prop = meta.get('property', '')
+                content = meta.get('content', '')
+                
+                if prop in ['og:video', 'og:video:url', 'og:video:secure_url'] and content:
+                    video_url = urljoin(base_url, content)
+                    media_info['videos'].append(video_url)
+                
+                if prop in ['og:image', 'twitter:image', 'pinterest:image'] and content:
+                    image_url = urljoin(base_url, content)
+                    media_info['images'].append(image_url)
+            
+            # 3. В JSON-LD
+            for script in soup.find_all('script', type='application/ld+json'):
+                try:
+                    import json
+                    data = json.loads(script.string)
+                    self._extract_from_jsonld(data, media_info, base_url)
+                except:
+                    continue
+            
+            # 4. Ищем по классам Pinterest (резервный метод)
+            for img in soup.find_all('img', {'src': re.compile(r'\.(jpg|jpeg|png|gif|webp)')}):
+                src = img.get('src')
+                if src and 'pinimg.com' in src:
+                    image_url = urljoin(base_url, src)
+                    if image_url not in media_info['images']:
+                        media_info['images'].append(image_url)
+            
+            # Удаляем дубликаты
+            media_info['videos'] = list(set(media_info['videos']))
+            media_info['images'] = list(set(media_info['images']))
+            
+        except Exception as e:
+            logger.error(f"Ошибка при извлечении медиа: {e}")
+        
+        return media_info
+    
+    def _extract_from_jsonld(self, data: dict, media_info: dict, base_url: str):
+        """Рекурсивно извлекает медиа из JSON-LD данных"""
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if key in ['contentUrl', 'url', 'image', 'video']:
+                    if isinstance(value, str) and value:
+                        media_url = urljoin(base_url, value)
+                        if value.endswith(('.mp4', '.webm', '.mov', '.avi')):
+                            if media_url not in media_info['videos']:
+                                media_info['videos'].append(media_url)
+                        elif value.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+                            if media_url not in media_info['images']:
+                                media_info['images'].append(media_url)
+                elif isinstance(value, (dict, list)):
+                    self._extract_from_jsonld(value, media_info, base_url)
+        elif isinstance(data, list):
+            for item in data:
+                self._extract_from_jsonld(item, media_info, base_url)
+    
+    async def download_media(self, url: str, media_type: str) -> Tuple[Optional[str], Optional[str]]:
+        """Скачивает медиа по URL"""
+        try:
+            # Создаем временную директорию
+            temp_dir = Path('temp')
+            temp_dir.mkdir(exist_ok=True)
+            
+            # Генерируем имя файла
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            extension = '.mp4' if media_type == 'video' else '.jpg'
+            filename = f"pinterest_{media_type}_{timestamp}{extension}"
+            filepath = temp_dir / filename
+            
+            # Проверяем размер файла перед скачиванием
+            session = await self.create_session()
+            
+            async with session.head(url, allow_redirects=True) as response:
+                if response.status == 200:
+                    content_length = response.headers.get('Content-Length')
+                    if content_length:
+                        file_size = int(content_length)
+                        if file_size > MAX_FILE_SIZE:
+                            return None, f"Файл слишком большой ({file_size/1024/1024:.1f} MB). Максимум: {MAX_FILE_SIZE/1024/1024} MB"
+            
+            # Скачиваем файл
+            logger.info(f"Начинаю скачивание {media_type}: {url}")
+            
+            async with session.get(url) as response:
+                if response.status == 200:
+                    # Проверяем размер по мере скачивания
+                    downloaded = 0
+                    
+                    with open(filepath, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(1024*1024):  # 1MB chunks
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            if downloaded > MAX_FILE_SIZE:
+                                f.close()
+                                if filepath.exists():
+                                    filepath.unlink()
+                                return None, f"Файл превысил максимальный размер ({MAX_FILE_SIZE/1024/1024} MB)"
+                    
+                    # Проверяем окончательный размер
+                    final_size = filepath.stat().st_size
+                    if final_size > MAX_FILE_SIZE:
+                        filepath.unlink()
+                        return None, f"Файл слишком большой ({final_size/1024/1024:.1f} MB)"
+                    
+                    return str(filepath), None
+                else:
+                    return None, f"Ошибка загрузки: статус {response.status}"
+                
+        except asyncio.TimeoutError:
+            return None, "Таймаут при загрузке файла"
+        except Exception as e:
+            logger.error(f"Ошибка при скачивании {url}: {e}")
+            return None, f"Ошибка загрузки: {str(e)}"
+    
+    async def get_pinterest_media(self, url: str) -> Tuple[Optional[str], Optional[str], str]:
+        """Основная функция для получения медиа с Pinterest"""
+        try:
+            if not self.is_pinterest_url(url):
+                return None, None, "Это не ссылка Pinterest"
+            
+            session = await self.create_session()
+            
+            # Получаем HTML страницы
+            async with session.get(url) as response:
+                if response.status != 200:
+                    return None, None, f"Ошибка доступа к странице: статус {response.status}"
+                
+                html = await response.text()
+            
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Извлекаем медиа URL
+            media_info = await self.extract_media_urls(soup, url)
+            
+            # Пытаемся скачать видео (если есть)
+            if media_info['videos']:
+                for video_url in media_info['videos'][:3]:  # Ограничиваем первые 3 видео
+                    filepath, error = await self.download_media(video_url, 'video')
+                    if filepath:
+                        return filepath, 'video', "Видео успешно загружено!"
+            
+            # Если видео нет, скачиваем изображение (если есть)
+            if media_info['images']:
+                for image_url in media_info['images'][:5]:  # Ограничиваем первые 5 изображений
+                    filepath, error = await self.download_media(image_url, 'image')
+                    if filepath:
+                        return filepath, 'image', "Изображение успешно загружено!"
+                    elif error:
+                        logger.warning(f"Не удалось загрузить изображение {image_url}: {error}")
+            
+            return None, None, "Не удалось найти доступные медиа для скачивания"
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обработке Pinterest URL {url}: {e}")
+            return None, None, f"Ошибка: {str(e)}"
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    welcome_text = """
+    🎉 Добро пожаловать в Pinterest Downloader Bot! 🎉
+
+    Отправьте мне ссылку на пин (pin) с Pinterest, и я скачаю для вас:
+    📹 Видео - если оно есть в пине
+    📸 Изображение - если видео нет или не скачивается
+
+    Просто скопируйте ссылку из Pinterest и отправьте её мне!
+
+    ⚠️ Ограничения:
+    • Максимальный размер файла: {} MB
+    • Поддерживаются только публичные пины
+    • Некоторые видео могут быть защищены от скачивания
+
+    🚀 Начните, отправив ссылку!
+    """.format(MAX_FILE_SIZE // (1024 * 1024))
+    
+    await update.message.reply_text(welcome_text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    help_text = """
+    📖 Помощь по использованию бота:
+
+    1. Найдите пин на Pinterest который хотите скачать
+    2. Скопируйте ссылку из адресной строки браузера
+    3. Отправьте ссылку этому боту
+
+    🔗 Примеры ссылок:
+    • https://www.pinterest.com/pin/1234567890/
+    • https://pin.it/abc123def
+    • https://pinterest.ru/pin/1234567890/
+
+    ⚠️ Важно:
+    • Ссылка должна быть именно на конкретный пин, а не на доску или профиль
+    • Бот работает только с публично доступным контентом
+    • Скачивание защищенного контента может быть невозможно
+
+    ❓ Если возникли проблемы:
+    • Проверьте, что ссылка правильная
+    • Убедитесь, что пин публичный
+    • Попробуйте другую ссылку
+
+    📞 Для поддержки: ...
+    """
+    await update.message.reply_text(help_text)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстовых сообщений"""
+    user_message = update.message.text.strip()
+    
+    # Проверяем, похоже ли сообщение на ссылку
+    if not (user_message.startswith('http://') or user_message.startswith('https://')):
+        await update.message.reply_text("Пожалуйста, отправьте ссылку на пин с Pinterest.")
+        return
+    
+    # Отправляем сообщение о начале обработки
+    status_msg = await update.message.reply_text("🔍 Анализирую ссылку...")
+    
+    try:
+        # Создаем загрузчик
+        downloader = PinterestDownloader()
+        
+        # Получаем медиа
+        await update.message.chat.send_action(action="typing")
+        filepath, media_type, message = await downloader.get_pinterest_media(user_message)
+        
+        # Закрываем сессию
+        await downloader.close_session()
+        
+        if filepath and media_type:
+            # Отправляем медиа пользователю
+            await update.message.chat.send_action(action="upload_video" if media_type == 'video' else "upload_photo")
+            
+            try:
+                if media_type == 'video':
+                    with open(filepath, 'rb') as f:
+                        await update.message.reply_video(
+                            video=f,
+                            caption="✅ Видео успешно скачано с Pinterest!",
+                            supports_streaming=True
+                        )
+                else:
+                    with open(filepath, 'rb') as f:
+                        await update.message.reply_photo(
+                            photo=f,
+                            caption="✅ Изображение успешно скачано с Pinterest!"
+                        )
+                
+                # Удаляем временный файл
+                try:
+                    os.remove(filepath)
+                except:
+                    pass
+                    
+            except Exception as e:
+                logger.error(f"Ошибка при отправке файла: {e}")
+                await update.message.reply_text(f"⚠️ Файл скачан, но возникла ошибка при отправке: {str(e)}")
+        else:
+            await update.message.reply_text(f"❌ {message}")
+    
+    except Exception as e:
+        logger.error(f"Ошибка в обработке сообщения: {e}")
+        await update.message.reply_text(f"⚠️ Произошла ошибка: {str(e)}")
+    
+    finally:
+        # Удаляем сообщение о статусе
+        try:
+            await status_msg.delete()
+        except:
+            pass
+
+async def cleanup_temp_files(context: ContextTypes.DEFAULT_TYPE):
+    """Очистка временных файлов"""
+    try:
+        temp_dir = Path('temp')
+        if temp_dir.exists():
+            for file in temp_dir.glob('*'):
+                try:
+                    # Удаляем файлы старше 1 часа
+                    if file.stat().st_mtime < (datetime.now().timestamp() - 3600):
+                        file.unlink()
+                except:
+                    continue
+    except Exception as e:
+        logger.error(f"Ошибка при очистке temp файлов: {e}")
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Ошибка вызвана {update}: {context.error}")
+    
+    try:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⚠️ Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже."
+        )
+    except:
+        pass
+
+def main():
+    """Основная функция запуска бота"""
+    # Создаем директорию для временных файлов
+    Path('temp').mkdir(exist_ok=True)
+    
+    # Создаем приложение
+    application = Application.builder().token(TOKEN).build()
+    
+    # Регистрируем обработчики команд
+    application.add_handler(CommandHandler('start', start_command))
+    application.add_handler(CommandHandler('help', help_command))
+    
+    # Регистрируем обработчик текстовых сообщений
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Регистрируем обработчик ошибок
+    application.add_error_handler(error_handler)
+    
+    # Настраиваем периодическую очистку временных файлов
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(cleanup_temp_files, interval=CLEANUP_INTERVAL, first=10)
+    
+    # Запускаем бота
+    logger.info("Бот запущен...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
 # Состояния диалога
 class States(Enum):
     START = 0
