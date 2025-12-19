@@ -1,6 +1,6 @@
-# requirements.txt
 python-telegram-bot==20.7
+requests==2.31.0
+beautifulsoup4==4.12.2
+yt-dlp==2023.12.30
 python-dotenv==1.0.0
-pyrogram==2.0.106
-tgcrypto==1.2.5
-APScheduler==3.10.4
+aiohttp==3.9.1
